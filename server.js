@@ -1,25 +1,83 @@
-const express=require('express'); const fs=require('fs'); const fsp=fs.promises; const path=require('path'); const os=require('os'); const crypto=require('crypto'); const {spawn}=require('child_process'); const OpenAI=require('openai'); const {google}=require('googleapis');
-const app=express(); app.use(express.json({limit:'1mb'})); app.use(express.urlencoded({extended:false,limit:'16kb'}));
-const PORT=process.env.PORT||3000, BASE=process.env.GOOGLE_REDIRECT_URI?.replace(/\/oauth2callback$/,'')||''; const jobs=new Map();
-function run(cmd,args,{cwd,timeout=0}={}){return new Promise((res,rej)=>{const p=spawn(cmd,args,{cwd});let out='',err='';p.stdout.on('data',d=>out+=d);p.stderr.on('data',d=>err+=d);let t=timeout?setTimeout(()=>p.kill('SIGKILL'),timeout):null;p.on('error',rej);p.on('close',c=>{if(t)clearTimeout(t);c===0?res({out,err}):rej(new Error(`${cmd} exited ${c}: ${err.slice(-4000)}`))})})}
-function env(name){return String(process.env[name]||'').trim()}
-function oauth(){return new google.auth.OAuth2(env('GOOGLE_CLIENT_ID'),env('GOOGLE_CLIENT_SECRET'),env('GOOGLE_REDIRECT_URI'))}
-const TOKEN_FILE='/tmp/google-token.json'; async function token(){try{return JSON.parse(await fsp.readFile(TOKEN_FILE,'utf8'))}catch{return null}}
-app.get('/auth/google',(req,res)=>{const o=oauth();res.redirect(o.generateAuthUrl({access_type:'offline',prompt:'consent',scope:['https://www.googleapis.com/auth/drive.file']}))});
-app.get('/oauth2callback',async(req,res)=>{try{const o=oauth();const {tokens}=await o.getToken(req.query.code);await fsp.writeFile(TOKEN_FILE,JSON.stringify(tokens));res.send('Google Drive connected. You can return to Seblunky Clip Farm.')}catch(e){res.status(500).send('Google connection failed: '+e.message)}});
-async function driveClient(){const t=await token();if(!t)throw new Error('Google Drive is not connected yet. Tap Connect Google Drive first.');const o=oauth();o.setCredentials(t);o.on('tokens',async n=>{const merged={...t,...n};await fsp.writeFile(TOKEN_FILE,JSON.stringify(merged))});return google.drive({version:'v3',auth:o})}
-function esc(v){return String(v??'').replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]))}
-function page({message='Ready.',jobId='',url='',connected=false}={}){return `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Seblunky Clip Farm</title><style>body{font-family:system-ui;background:#0c0d12;color:#fff;margin:0;padding:24px}.c{max-width:680px;margin:30px auto;background:#171820;border:1px solid #333;border-radius:24px;padding:24px}input,button,.btn{box-sizing:border-box;width:100%;font-size:18px;padding:16px;border-radius:14px;margin:8px 0}input{background:#0d0e13;color:#fff;border:1px solid #555}button,.btn{border:0;font-weight:700;text-align:center;text-decoration:none;display:block;background:#1597ff;color:white}.drive{background:#eee;color:#0787ef}.s{white-space:pre-wrap;background:#0d0e13;padding:16px;border-radius:14px;margin-top:16px}.ok{color:#7ee787}</style></head><body><div class=c><h1>Seblunky Clip Farm</h1><p>Paste a YouTube VOD. The server will create exactly 5 clean clips and upload them to Google Drive.</p><a class="btn drive" href="/auth/google">${connected?'Reconnect Google Drive':'Connect Google Drive'}</a>${connected?'<p class="ok">✓ Google Drive connected</p>':''}<form method="POST" action="/start"><input name="url" type="url" inputmode="url" autocomplete="url" required value="${esc(url)}" placeholder="https://www.youtube.com/watch?v=..."><button type="submit">Create 5 Clips</button></form><div class=s>${esc(message)}${jobId?`\nJob: ${esc(jobId)}\n\nRefresh this page to update status.`:''}</div></div></body></html>`}
-app.get('/',async(q,r)=>{const t=await token();const id=String(q.query.job||'');const j=id?jobs.get(id):null;r.set('Cache-Control','no-store');r.send(page({connected:!!t,jobId:id,message:j?`${j.status}\n${j.message||''}${j.files?'\n\n'+j.files.join('\n'):''}`:'Ready.'}))});
-app.post('/start',async(q,r)=>{const url=String(q.body.url||'').trim();const connected=!!(await token());if(!/^https?:\/\/(www\.)?(youtube\.com|youtu\.be)\//i.test(url))return r.status(400).send(page({connected,url,message:'Paste a valid YouTube URL.'}));if(!connected)return r.status(400).send(page({connected:false,url,message:'Connect Google Drive first.'}));const id=crypto.randomUUID();jobs.set(id,{id,status:'queued',message:'Queued on Railway…'});processJob(id,url).catch(e=>{let j=jobs.get(id)||{};jobs.set(id,{...j,status:'failed',message:e.message})});r.redirect(303,'/?job='+encodeURIComponent(id))});
-app.get('/health',(q,r)=>{const id=env('GOOGLE_CLIENT_ID'),sec=env('GOOGLE_CLIENT_SECRET'),redir=env('GOOGLE_REDIRECT_URI');r.json({ok:true,oauth:{clientId:id,clientSecretLength:sec.length,clientSecretSuffix:sec.slice(-4),redirectUri:redir}})}); app.get('/api/jobs/:id',(q,r)=>{let j=jobs.get(q.params.id);j?r.json(j):r.status(404).json({error:'Job not found'})});
-app.post('/api/jobs',(q,r)=>{const url=String(q.body.url||'').trim();if(!/^https?:\/\/(www\.)?(youtube\.com|youtu\.be)\//i.test(url))return r.status(400).json({error:'Paste a valid YouTube URL.'});const id=crypto.randomUUID();jobs.set(id,{id,status:'queued',message:'Queued on Railway…'});r.status(202).json({id});processJob(id,url).catch(e=>{let j=jobs.get(id)||{};jobs.set(id,{...j,status:'failed',message:e.message})})});
-async function processJob(id,url){const j=()=>jobs.get(id);const set=(status,message,x={})=>jobs.set(id,{...j(),status,message,...x});let dir=await fsp.mkdtemp(path.join(os.tmpdir(),'seblunky-'));try{
-set('downloading','Downloading VOD from YouTube…');const src=path.join(dir,'source.mp4');await run('yt-dlp',['--no-playlist','--js-runtimes',`node:${process.execPath}`,'-f','bv*[height<=720]+ba/b[height<=720]/b','--merge-output-format','mp4','-o',src,url],{timeout:2*60*60*1000});
-set('transcribing','Extracting audio…');const aud=path.join(dir,'audio.mp3');await run('ffmpeg',['-y','-i',src,'-vn','-ac','1','-ar','16000','-b:a','48k',aud],{timeout:60*60*1000});
-set('transcribing','Transcribing VOD with OpenAI…');const ai=new OpenAI({apiKey:process.env.OPENAI_API_KEY});const tr=await ai.audio.transcriptions.create({file:fs.createReadStream(aud),model:'whisper-1',response_format:'verbose_json',timestamp_granularities:['segment']});const seg=(tr.segments||[]).map(x=>({start:x.start,end:x.end,text:x.text}));if(!seg.length)throw new Error('Transcription returned no timestamped segments.');
-set('selecting','AI is choosing the 5 strongest moments…');const compact=seg.map(x=>`[${x.start.toFixed(1)}-${x.end.toFixed(1)}] ${x.text}`).join('\n');const prompt=`Choose exactly 5 distinct, non-overlapping, self-contained entertaining clips from this gaming/creator VOD transcript. Favor funny reactions, surprising moments, conflict, strong opinions, stories, high energy, or clear payoff. Each clip should normally be 20-60 seconds, may be 12-75 seconds when justified, and must start/end on natural boundaries. Return ONLY JSON: {"clips":[{"start":number,"end":number,"title":"short filename-safe title","reason":"brief reason"}]}. Transcript:\n${compact}`;const resp=await ai.responses.create({model:'gpt-5-mini',input:prompt});let txt=resp.output_text.trim().replace(/^```json\s*/,'').replace(/```$/,'');let pick=JSON.parse(txt).clips;if(!Array.isArray(pick)||pick.length!==5)throw new Error('AI did not return exactly 5 clips.');pick=pick.sort((a,b)=>a.start-b.start);for(let i=0;i<5;i++){if(!(pick[i].end>pick[i].start)||pick[i].start<0||(i&&pick[i].start<pick[i-1].end))throw new Error('AI returned invalid/overlapping clip times.')}
-set('rendering','Rendering 5 clean MP4 clips…');const outs=[];for(let i=0;i<5;i++){const c=pick[i],out=path.join(dir,`Seblunky_Clip_${i+1}.mp4`);await run('ffmpeg',['-y','-ss',String(c.start),'-to',String(c.end),'-i',src,'-vf','scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2','-c:v','libx264','-preset','veryfast','-crf','21','-c:a','aac','-b:a','160k','-movflags','+faststart',out],{timeout:60*60*1000});outs.push(out)}
-set('uploading','Uploading exactly 5 clips to Google Drive…');const drive=await driveClient();const files=[];for(let i=0;i<outs.length;i++){const up=await drive.files.create({requestBody:{name:path.basename(outs[i])},media:{mimeType:'video/mp4',body:fs.createReadStream(outs[i])},fields:'id,name,webViewLink'});files.push(`${up.data.name}: ${up.data.webViewLink||up.data.id}`)}set('complete','Done — 5 clips uploaded to Google Drive.',{files,clips:pick});
-}finally{await fsp.rm(dir,{recursive:true,force:true}).catch(()=>{})}}
-app.listen(PORT,'0.0.0.0',()=>console.log('Seblunky Clip Farm listening on',PORT));
+const express = require("express");
+const fs = require("fs");
+const fsp = fs.promises;
+const path = require("path");
+const os = require("os");
+const crypto = require("crypto");
+const { spawn } = require("child_process");
+const OpenAI = require("openai");
+const { google } = require("googleapis");
+
+const app = express();
+
+app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ extended: false, limit: "16kb" }));
+
+const PORT = process.env.PORT || 3000;
+const jobs = new Map();
+
+function log(...args) {
+  console.log(new Date().toISOString(), ...args);
+}
+
+function logError(...args) {
+  console.error(new Date().toISOString(), ...args);
+}
+
+function env(name) {
+  return String(process.env[name] || "").trim();
+}
+
+function run(cmd, args, { cwd, timeout = 0 } = {}) {
+  return new Promise((resolve, reject) => {
+    log(`[COMMAND] ${cmd} ${args.join(" ")}`);
+
+    const p = spawn(cmd, args, { cwd });
+
+    let out = "";
+    let err = "";
+    let settled = false;
+
+    p.stdout.on("data", (d) => {
+      out += d.toString();
+    });
+
+    p.stderr.on("data", (d) => {
+      err += d.toString();
+    });
+
+    const timer = timeout
+      ? setTimeout(() => {
+          logError(`[TIMEOUT] ${cmd}`);
+          p.kill("SIGKILL");
+        }, timeout)
+      : null;
+
+    p.on("error", (e) => {
+      if (timer) clearTimeout(timer);
+
+      if (!settled) {
+        settled = true;
+        logError(`[SPAWN ERROR] ${cmd}:`, e.message);
+        reject(
+          new Error(
+            `${cmd} could not start: ${e.message}. ` +
+              `The executable may not be installed in the Railway container.`
+          )
+        );
+      }
+    });
+
+    p.on("close", (code) => {
+      if (timer) clearTimeout(timer);
+      if (settled) return;
+
+      settled = true;
+
+      if (code === 0) {
+        log(`[COMMAND OK] ${cmd}`);
+        resolve({ out, err });
+      } else {
+        const details = (err || out || "").slice(-6000);
+
+        logError(`[COMMAND FAILED] ${cmd}
