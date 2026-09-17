@@ -1,15 +1,1 @@
-{
-  "name": "seblunky-clip-farm",
-  "version": "0.1.0",
-  "private": true,
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
-  "engines": {
-    "node": ">=22"
-  },
-  "dependencies": {
-    "express": "^5.1.0"
-  }
-}
+{"name":"seblunky-clip-farm","version":"1.0.0","private":true,"type":"commonjs","scripts":{"start":"node server.js"},"dependencies":{"express":"^5.1.0","googleapis":"^144.0.0","openai":"^5.12.2"}}
